@@ -39,6 +39,7 @@ ASSIGNEES = {
     "D": os.getenv("JIRA_ASSIGNEE_D"),
 }
 
+
 MONTHS = {
     "jan": 1,
     "feb": 2,
@@ -71,6 +72,7 @@ MONTHS = {
 # The previous parser could not correctly parse headings where the
 # month appeared between the start and end day.
 #
+
 WEEK_RE = re.compile(
     r"^##\s+"
     r"(?P<start>\d{1,2})"
@@ -383,8 +385,10 @@ def create_issue(task: Task) -> str:
                 "key": PROJECT_KEY
             },
 
+            # Use the issue type name instead of the old
+            # hardcoded issue-type ID from the previous Jira project.
             "issuetype": {
-                "id": "10003"
+                "name": "Task"
             },
 
             "summary": (
