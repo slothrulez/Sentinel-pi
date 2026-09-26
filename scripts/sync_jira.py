@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Idempotently sync unchecked PiSentinel checklist items into Jira Tasks."""
+"""Idempotently sync unchecked PiSentinel checklist items into Jira Tasks.
+
+- Reads checklists/*.md
+- Only [ ] items are synced
+- [x]/[X] completed and [!] blocked items are ignored
+- Non-week headings such as "## Current status" are ignored
+- Uses a stable SHA-256 label for duplicate prevention
+- Existing synced issues are skipped; missing ones are created
+"""
 
 from __future__ import annotations
 
@@ -14,30 +22,22 @@ from pathlib import Path
 import requests
 
 
-# ============================================================
+# ---------------------------------------------------------------------------
 # Configuration
-# ============================================================
+# ---------------------------------------------------------------------------
 
 BASE_URL = os.environ["JIRA_BASE_URL"].rstrip("/")
 EMAIL = os.environ["JIRA_EMAIL"]
 TOKEN = os.environ["JIRA_API_TOKEN"]
-
 PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "KAN")
 CHECKLIST_DIR = Path(os.getenv("CHECKLIST_DIR", "checklists"))
 
-
-# Jira account IDs are configuration values, not secrets.
 ASSIGNEES = {
     "A": os.environ["JIRA_ASSIGNEE_A"],
     "B": os.environ["JIRA_ASSIGNEE_B"],
     "C": os.environ["JIRA_ASSIGNEE_C"],
     "D": os.environ["JIRA_ASSIGNEE_D"],
 }
-
-
-# ============================================================
-# Parsing configuration
-# ============================================================
 
 MONTHS = {
     "jan": 1,
@@ -54,13 +54,10 @@ MONTHS = {
     "dec": 12,
 }
 
-
 # Matches headings such as:
-#
 # ## 21–27 Sep — Edge Foundation
 # ## 28 Sep–4 Oct — Event Collection Skeleton
-# ## 5–11 Oct — Session Builder
-#
+# ## 22–28 Feb — Final
 WEEK_RE = re.compile(
     r"^##\s+"
     r"(?P<start>\d{1,2})"
@@ -72,31 +69,15 @@ WEEK_RE = re.compile(
     r"\s*$"
 )
 
-
-# Matches:
-#
-# - [ ] Task
-# - [x] Completed task
-# - [!] Blocked task
-#
 TASK_RE = re.compile(
     r"^- \[(?P<state>[ xX!])\]\s+(?P<task>.+?)\s*$"
 )
 
-
-# Matches checklist title such as:
-#
-# # PiSentinel — Edge Computing / Network Telemetry (A) Checklist
-#
 ROLE_RE = re.compile(
     r"^#\s+PiSentinel\s+—\s+.+?\s+"
     r"\((?P<member>[ABCD])\)\s+Checklist"
 )
 
-
-# ============================================================
-# Data model
-# ============================================================
 
 @dataclass(frozen=True)
 class Task:
@@ -108,150 +89,85 @@ class Task:
     due_date: date
 
 
-# ============================================================
-# Date parsing
-# ============================================================
+# ---------------------------------------------------------------------------
+# Checklist parsing
+# ---------------------------------------------------------------------------
 
 def due_date_for(heading: str) -> date | None:
+    """Return the week-ending date for a valid week heading.
+
+    Non-week headings return None instead of raising. This is important
+    because the checklists also contain headings such as "## Current status".
     """
-    Return the week-end date for a valid week heading.
-
-    Informational headings such as:
-
-        ## Current status
-
-    return None instead of raising an exception.
-    """
-
     match = WEEK_RE.match(heading)
-
     if not match:
         return None
 
-    start_month = MONTHS[
-        match.group("month")[:3].lower()
-    ]
+    start_month = MONTHS[match.group("month")[:3].lower()]
 
     end_month = MONTHS[
         (match.group("end_month") or match.group("month"))[:3].lower()
     ]
 
-    end_day = int(
-        match.group("end") or match.group("start")
-    )
+    end_day = int(match.group("end") or match.group("start"))
 
-    # PiSentinel build period:
-    # September 2026 -> February 2027.
+    # Project starts in Sep 2026 and ends in Feb 2027.
     start_year = 2026 if start_month >= 9 else 2027
+    end_year = start_year if end_month >= start_month else start_year + 1
 
-    end_year = (
-        start_year
-        if end_month >= start_month
-        else start_year + 1
-    )
+    return date(end_year, end_month, end_day)
 
-    return date(
-        end_year,
-        end_month,
-        end_day,
-    )
-
-
-# ============================================================
-# Checklist parser
-# ============================================================
 
 def parse_checklist(path: Path) -> list[Task]:
-    """
-    Parse one member checklist.
-
-    Only unchecked [ ] tasks under valid week headings
-    become Jira issues.
-
-    [x] completed tasks are ignored.
-    [!] blocked tasks are ignored.
-
-    Informational headings such as "## Current status"
-    are ignored for Jira due-date purposes.
-    """
-
-    lines = path.read_text(
-        encoding="utf-8"
-    ).splitlines()
-
-    # --------------------------------------------------------
-    # Determine team member
-    # --------------------------------------------------------
+    """Parse one member checklist and return only pending week tasks."""
+    lines = path.read_text(encoding="utf-8").splitlines()
 
     member = None
 
+    # Member identity is encoded in the first heading.
     for line in lines[:5]:
         match = ROLE_RE.match(line.strip())
-
         if match:
             member = match.group("member")
             break
 
     if member is None:
-        raise ValueError(
-            f"Cannot determine A/B/C/D from {path}"
-        )
-
-    # --------------------------------------------------------
-    # Parse tasks
-    # --------------------------------------------------------
+        raise ValueError(f"Cannot determine A/B/C/D from {path}")
 
     tasks: list[Task] = []
 
-    heading = None
-    heading_title = None
-    due_date = None
+    heading: str | None = None
+    heading_title: str | None = None
+    due_date: date | None = None
 
     for line in lines:
-
-        # ----------------------------------------------------
-        # Heading
-        # ----------------------------------------------------
-
         if line.startswith("## "):
-
             heading = line.strip()
-
             match = WEEK_RE.match(heading)
 
             if match:
                 heading_title = match.group("title")
                 due_date = due_date_for(heading)
             else:
-                # Informational/non-week heading.
-                #
-                # Example:
-                # ## Current status
-                #
+                # Examples: "## Current status"
                 heading_title = heading[3:].strip()
                 due_date = None
 
             continue
 
-        # ----------------------------------------------------
-        # Task
-        # ----------------------------------------------------
-
         match = TASK_RE.match(line)
-
         if not match:
             continue
 
-        # A task must be inside a valid week heading.
+        # Tasks outside a valid week section are ignored.
         if heading is None or due_date is None:
             continue
 
         state = match.group("state")
 
-        # Only unchecked [ ] tasks become Jira issues.
-        #
-        # [x] = completed
-        # [!] = blocked
+        # Only unchecked [ ] tasks are created.
+        # [x], [X] = completed
+        # [!] = blocked/dependency
         if state != " ":
             continue
 
@@ -271,44 +187,19 @@ def parse_checklist(path: Path) -> list[Task]:
     return tasks
 
 
-# ============================================================
-# Stable task ID
-# ============================================================
+# ---------------------------------------------------------------------------
+# Stable IDs / Jira helpers
+# ---------------------------------------------------------------------------
 
 def stable_id(task: Task) -> str:
-    """
-    Generate a deterministic ID for a checklist task.
-
-    The same checklist item will always produce the same ID,
-    preventing duplicate Jira issues on repeated syncs.
-    """
-
-    raw = (
-        f"{task.source_file}|"
-        f"{task.week}|"
-        f"{task.text}"
-    ).encode()
-
+    """Generate a deterministic ID that stays the same across sync runs."""
+    raw = f"{task.source_file}|{task.week}|{task.text}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:12]
 
 
-# ============================================================
-# Jira authentication
-# ============================================================
-
 def auth_headers() -> dict[str, str]:
-    """
-    Build Jira Basic Auth headers using:
-
-        JIRA_EMAIL
-        JIRA_API_TOKEN
-    """
-
     credentials = f"{EMAIL}:{TOKEN}"
-
-    encoded = base64.b64encode(
-        credentials.encode()
-    ).decode()
+    encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
 
     return {
         "Authorization": f"Basic {encoded}",
@@ -317,15 +208,7 @@ def auth_headers() -> dict[str, str]:
     }
 
 
-# ============================================================
-# Jira HTTP helper
-# ============================================================
-
 def jira(method: str, path: str, **kwargs):
-    """
-    Make an authenticated Jira REST API request.
-    """
-
     response = requests.request(
         method,
         f"{BASE_URL}{path}",
@@ -341,26 +224,15 @@ def jira(method: str, path: str, **kwargs):
             f"{response.text}"
         )
 
-    return (
-        response.json()
-        if response.content
-        else {}
-    )
+    return response.json() if response.content else {}
 
-
-# ============================================================
-# Jira description
-# ============================================================
 
 def description_adf(task: Task) -> dict:
-    """
-    Build a Jira Atlassian Document Format description.
-    """
-
     paragraphs = [
         f"Member: {task.member}",
         f"Source: checklists/{task.source_file}",
         f"Week: {task.week}",
+        f"Week title: {task.week_title}",
         f"Stable task ID: {stable_id(task)}",
         "",
         "Checklist item:",
@@ -368,9 +240,8 @@ def description_adf(task: Task) -> dict:
         "",
         "Definition of done:",
         (
-            "Working code/output is built, run, tested, "
-            "and committed. Update the Markdown checklist "
-            "only after the work is actually complete."
+            "Working code/output is built, run, tested, and committed. "
+            "Update the Markdown checklist only after the work is actually complete."
         ),
     ]
 
@@ -380,34 +251,18 @@ def description_adf(task: Task) -> dict:
         "content": [
             {
                 "type": "paragraph",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": line or " ",
-                    }
-                ],
+                "content": [{"type": "text", "text": line or " "}],
             }
             for line in paragraphs
         ],
     }
 
 
-# ============================================================
-# Duplicate detection
-# ============================================================
-
 def existing_issue(task: Task) -> dict | None:
-    """
-    Search Jira for an existing issue with this task's
-    deterministic label.
-    """
-
+    """Find an already-synced task using its deterministic label."""
     label = f"pisentinel-{stable_id(task)}"
 
-    jql = (
-        f'project = "{PROJECT_KEY}" '
-        f'AND labels = "{label}"'
-    )
+    jql = f'project = "{PROJECT_KEY}" AND labels = "{label}"'
 
     data = jira(
         "GET",
@@ -415,55 +270,31 @@ def existing_issue(task: Task) -> dict | None:
         params={
             "jql": jql,
             "maxResults": 1,
-            "fields": (
-                "summary,status,assignee,labels"
-            ),
+            "fields": "summary,status,assignee,labels",
         },
     )
 
     issues = data.get("issues", [])
-
     return issues[0] if issues else None
 
 
-# ============================================================
-# Jira issue creation
-# ============================================================
-
 def create_issue(task: Task) -> str:
-    """
-    Create a Jira Task for one checklist item.
-    """
-
+    """Create one Jira Task."""
     stable = stable_id(task)
 
     payload = {
         "fields": {
-            "project": {
-                "key": PROJECT_KEY
-            },
-
-            # Jira Task issue type.
-            "issuetype": {
-                "id": "10003"
-            },
-
-            "summary": (
-                f"[{task.member}] "
-                f"{task.text}"
-            ),
-
+            "project": {"key": PROJECT_KEY},
+            "issuetype": {"id": "10003"},
+            "summary": f"[{task.member}] {task.text}",
             "description": description_adf(task),
-
             "assignee": {
                 "accountId": ASSIGNEES[task.member]
             },
-
             "labels": [
                 "pisentinel-sync",
                 f"pisentinel-{stable}",
             ],
-
             "duedate": task.due_date.isoformat(),
         }
     }
@@ -477,79 +308,68 @@ def create_issue(task: Task) -> str:
     return response["key"]
 
 
-# ============================================================
+# ---------------------------------------------------------------------------
 # Main sync
-# ============================================================
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-
     if not CHECKLIST_DIR.exists():
         raise SystemExit(
-            f"Missing checklist directory: "
-            f"{CHECKLIST_DIR}"
+            f"Missing checklist directory: {CHECKLIST_DIR}"
         )
 
-    # --------------------------------------------------------
-    # Parse all member checklists
-    # --------------------------------------------------------
+    checklist_paths = sorted(
+        path
+        for path in CHECKLIST_DIR.glob("*.md")
+        if path.name.lower() != "readme.md"
+    )
+
+    if not checklist_paths:
+        raise SystemExit(
+            f"No checklist Markdown files found in {CHECKLIST_DIR}"
+        )
 
     tasks: list[Task] = []
 
-    for path in sorted(
-        CHECKLIST_DIR.glob("*.md")
-    ):
-
-        # README is documentation, not a checklist.
-        if path.name.lower() == "readme.md":
-            continue
-
-        print(
-            f"Reading checklist: {path}"
-        )
+    for path in checklist_paths:
+        print(f"Reading checklist: {path}")
 
         parsed_tasks = parse_checklist(path)
 
         print(
-            f"  Found {len(parsed_tasks)} "
-            f"pending week tasks"
+            f"  Found {len(parsed_tasks)} pending week tasks"
         )
 
         tasks.extend(parsed_tasks)
 
-    # --------------------------------------------------------
-    # Sync tasks to Jira
-    # --------------------------------------------------------
+    print()
+    print(f"Total pending checklist tasks: {len(tasks)}")
+    print()
 
     created = 0
     skipped = 0
 
     for task in tasks:
-
+        stable = stable_id(task)
         issue = existing_issue(task)
 
         if issue:
-
             skipped += 1
-
             print(
                 f"SKIP   {issue['key']}  "
-                f"{task.text}"
+                f"[{task.member}] {task.text} "
+                f"(id={stable})"
             )
-
             continue
 
         key = create_issue(task)
-
         created += 1
 
         print(
             f"CREATE {key}  "
-            f"{task.text}"
+            f"[{task.member}] {task.text} "
+            f"(id={stable})"
         )
-
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
 
     print()
     print("=" * 60)
@@ -560,10 +380,6 @@ def main() -> None:
     print(f"Pending tasks:   {len(tasks)}")
     print("=" * 60)
 
-
-# ============================================================
-# Entry point
-# ============================================================
 
 if __name__ == "__main__":
     main()
