@@ -1,0 +1,184 @@
+name: RESET PiSentinel Jira
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Reset Jira Tasks
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT_KEY: KAN
+        run: |
+          python <<'PY'
+          import base64
+          import os
+          import sys
+          import requests
+
+          BASE_URL = os.environ["JIRA_BASE_URL"].rstrip("/")
+          EMAIL = os.environ["JIRA_EMAIL"]
+          TOKEN = os.environ["JIRA_API_TOKEN"]
+          PROJECT = os.environ.get("JIRA_PROJECT_KEY", "KAN")
+
+          credentials = f"{EMAIL}:{TOKEN}"
+          encoded = base64.b64encode(
+              credentials.encode("utf-8")
+          ).decode("ascii")
+
+          HEADERS = {
+              "Authorization": f"Basic {encoded}",
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          }
+
+          def jira(method, path, **kwargs):
+              response = requests.request(
+                  method,
+                  f"{BASE_URL}{path}",
+                  headers=HEADERS,
+                  timeout=30,
+                  **kwargs
+              )
+
+              if not response.ok:
+                  print(
+                      f"ERROR: {method} {path}",
+                      file=sys.stderr
+                  )
+                  print(
+                      response.status_code,
+                      response.text,
+                      file=sys.stderr
+                  )
+                  sys.exit(1)
+
+              return (
+                  response.json()
+                  if response.content
+                  else {}
+              )
+
+          print("=" * 60)
+          print("PiSentinel Jira RESET")
+          print("=" * 60)
+
+          # ---------------------------------------------------------
+          # Find ALL Task issues in KAN
+          # ---------------------------------------------------------
+
+          issues = []
+          next_page_token = None
+
+          while True:
+              params = {
+                  "jql": (
+                      f'project = "{PROJECT}" '
+                      f'AND issuetype = Task'
+                  ),
+                  "maxResults": 100,
+                  "fields": "summary"
+              }
+
+              if next_page_token:
+                  params["nextPageToken"] = next_page_token
+
+              data = jira(
+                  "GET",
+                  "/rest/api/3/search/jql",
+                  params=params
+              )
+
+              batch = data.get("issues", [])
+              issues.extend(batch)
+
+              print(
+                  f"Found {len(batch)} issues "
+                  f"(total so far: {len(issues)})"
+              )
+
+              next_page_token = data.get(
+                  "nextPageToken"
+              )
+
+              if not next_page_token:
+                  break
+
+          print()
+          print(
+              f"TOTAL TASKS FOUND: {len(issues)}"
+          )
+
+          if not issues:
+              print("Nothing to delete.")
+              sys.exit(0)
+
+          print()
+          print("Issues that will be deleted:")
+
+          for issue in issues:
+              key = issue["key"]
+              summary = (
+                  issue.get("fields", {})
+                  .get("summary", "")
+              )
+
+              print(f"  {key} - {summary}")
+
+          print()
+          print(
+              "Starting deletion..."
+          )
+
+          # ---------------------------------------------------------
+          # Delete every Task
+          # ---------------------------------------------------------
+
+          deleted = 0
+          failed = 0
+
+          for issue in issues:
+              key = issue["key"]
+
+              try:
+                  jira(
+                      "DELETE",
+                      f"/rest/api/3/issue/{key}",
+                      params={
+                          "deleteSubtasks": "true"
+                      }
+                  )
+
+                  deleted += 1
+
+                  print(
+                      f"DELETED {key} "
+                      f"({deleted}/{len(issues)})"
+                  )
+
+              except SystemExit:
+                  failed += 1
+                  print(
+                      f"FAILED {key}"
+                  )
+
+          print()
+          print("=" * 60)
+          print("RESET COMPLETE")
+          print("=" * 60)
+          print(f"Found:   {len(issues)}")
+          print(f"Deleted: {deleted}")
+          print(f"Failed:  {failed}")
+          print("=" * 60)
+
+          if failed:
+              sys.exit(1)
+          PY
