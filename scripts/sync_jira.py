@@ -33,10 +33,10 @@ PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "KAN")
 CHECKLIST_DIR = Path(os.getenv("CHECKLIST_DIR", "checklists"))
 
 ASSIGNEES = {
-    "A": os.environ["JIRA_ASSIGNEE_A"],
-    "B": os.environ["JIRA_ASSIGNEE_B"],
-    "C": os.environ["JIRA_ASSIGNEE_C"],
-    "D": os.environ["JIRA_ASSIGNEE_D"],
+    "A": os.getenv("JIRA_ASSIGNEE_A"),
+    "B": os.getenv("JIRA_ASSIGNEE_B"),
+    "C": os.getenv("JIRA_ASSIGNEE_C"),
+    "D": os.getenv("JIRA_ASSIGNEE_D"),
 }
 
 MONTHS = {
